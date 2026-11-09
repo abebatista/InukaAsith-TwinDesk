@@ -46,13 +46,22 @@ class Remote(core: Core) : Feature(core) {
         push()
     }
     fun resetPad() { core.store.setPrefsString("remote.pad", "{}"); push() }
+
+    // The gamepad's layout (its Edit, remote.js): {items: {id: {x, y, s, hide, label}}, custom: [{id, label, key, x, y, s}]},
+    // x and y the control's middle as a share of the screen. Kept as the page wrote it (checked to be JSON, 32 KB at most).
+    fun layout(): JSONObject = runCatching { JSONObject(core.store.prefsString("remote.layout", "{}")) }.getOrDefault(JSONObject())
+    fun setLayout(json: String) {
+        if (json.length > 32_000) return
+        val o = runCatching { JSONObject(json) }.getOrNull() ?: return
+        core.store.setPrefsString("remote.layout", o.toString())
+    }
     private fun overrides(): JSONObject = runCatching { JSONObject(core.store.prefsString("remote.pad", "{}")) }.getOrDefault(JSONObject())
     private fun padMap(): JSONObject = JSONObject().also { o -> for ((id, _) in CONTROLS) o.put(id, padKey(id)) }
 
     fun opts(): JSONObject {
         ble = core.link.ble
         return msg("opts", "mode" to mode, "name" to (core.host?.name ?: "the computer"), "me" to core.store.deviceName, "connected" to (core.host != null),
-            "os" to (core.host?.os ?: ""), "ble" to core.link.ble, "speed" to speed.toDouble(), "tap" to tapClick, "smooth" to smooth, "pad" to padMap(),
+            "os" to (core.host?.os ?: ""), "ble" to core.link.ble, "speed" to speed.toDouble(), "tap" to tapClick, "smooth" to smooth, "pad" to padMap(), "layout" to layout(),
             "bt" to (core.btPadMade && core.btPad.connected), "btName" to (if (core.btPadMade) core.btPad.hostName else ""),
             // The gamepad's Keys: its controls and what each can press.
             "controls" to org.json.JSONArray(CONTROLS.map { org.json.JSONArray(listOf(it.first, it.second)) }),
@@ -158,20 +167,25 @@ class Remote(core: Core) : Feature(core) {
     }
 }
 
-// Full screen: the touchpad and keyboard (any way up), or the gamepad (held sideways).
+// Full screen: the touchpad and keyboard (any way up), the gamepad (held sideways), or voice typing.
 class RemoteActivity : ComponentActivity() {
     private var host: WebHost? = null
     private var mode = "pad"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        mode = if (intent.getStringExtra("mode") == "gamepad") "gamepad" else "pad"
+        mode = when (intent.getStringExtra("mode")) { "gamepad" -> "gamepad"; "voice" -> "voice"; else -> "pad" }
         if (mode == "gamepad") requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        WindowInsetsControllerCompat(window, window.decorView).apply {
-            hide(WindowInsetsCompat.Type.systemBars())
-            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        // Voice typing keeps the system bars, and the page sits inside them and above the keyboard
+        // (edge to edge is enforced, so by the insets: below), its box and keys in sight while
+        // Gboard's microphone listens.
+        if (mode != "voice") {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            WindowInsetsControllerCompat(window, window.decorView).apply {
+                hide(WindowInsetsCompat.Type.systemBars())
+                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
         }
         val h = WebHost(this, "remote.html", Core.get(this)) { ev, _ ->
             when (ev) {
@@ -186,7 +200,16 @@ class RemoteActivity : ComponentActivity() {
             }
         }
         host = h
-        setContentView(h.view)
+        if (mode == "voice") {
+            val frame = android.widget.FrameLayout(this).apply { setBackgroundColor(android.graphics.Color.rgb(11, 11, 13)) }
+            frame.addView(h.view, android.widget.FrameLayout.LayoutParams(-1, -1))
+            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(frame) { v, ins ->
+                val b = ins.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime() or WindowInsetsCompat.Type.displayCutout())
+                v.setPadding(b.left, b.top, b.right, b.bottom)
+                WindowInsetsCompat.CONSUMED
+            }
+            setContentView(frame)
+        } else setContentView(h.view)
     }
 
     override fun onStart() {

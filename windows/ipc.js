@@ -26,16 +26,16 @@ function setupIpc(ctx) {
     if (!require('../shared/i18n.js').savedLanguage(language)) return;
     change('ui', { language }, () => ctx.onLanguage());
   });
-  // General › Appearance: { theme } and/or { accent } ('' follows the system); local only.
+  // General › Appearance: { style }, { theme } and/or { accent } ('' follows the system); local only.
   handle('setLook', (o) => o && typeof o === 'object' && change('ui', {
-    ...(typeof o.theme === 'string' ? { theme: o.theme } : {}), ...(typeof o.accent === 'string' ? { accent: o.accent } : {}),
+    ...(typeof o.style === 'string' ? { style: o.style } : {}), ...(typeof o.theme === 'string' ? { theme: o.theme } : {}), ...(typeof o.accent === 'string' ? { accent: o.accent } : {}),
   }, () => ctx.onLook && ctx.onLook()));
   // Calls, Messages and Photos (shared/phonehub.js, loaded the first time it's used).
   handle('hub', (r) => ctx.hub().act(r));
 
   const pairWith = (d) => {
     discovery.clearInvite(d.id);
-    if (d.os === P.OS.ANDROID) return ctx.connectPhoneDev(d); // a phone has no server to pair with
+    if (P.isPhoneOs(d.os)) return ctx.connectPhoneDev(d); // a phone has no server to pair with
     link.startPairing({ address: d.address, port: d.port, macName: d.name, id: d.id }); // id: one met over Bluetooth
   };
   handle('pair', (target) => {
@@ -80,7 +80,7 @@ function setupIpc(ctx) {
     if (typeof id !== 'string') return;
     const d = discovery.get(id) || discovery.near(id);
     if (!d) return;
-    if (d.os === P.OS.ANDROID) return ctx.connectPhoneDev(d);
+    if (P.isPhoneOs(d.os)) return ctx.connectPhoneDev(d);
     link.expect(id);
     discovery.invite(d.address);
   });
@@ -98,6 +98,7 @@ function setupIpc(ctx) {
     if (partial && typeof partial.locked === 'boolean') kvm.setLocked(partial.locked); // cursor lock: not a setting
     const { linked, shared, locked, ...rest } = partial && typeof partial === 'object' ? partial : {};
     change('kvm', rest, () => kvm.applyConfig());
+    if ('keyboard' in rest) (ctx.phoneRemote ? ctx.phoneRemote.refresh() : ctx.loadRemote()); // voice typing follows Keyboard
   });
   handle('setLayout', (side) => kvm.setLayout(side));
   handle('moveKvm', (arg) => arg && typeof arg === 'object' && kvm.moveTo(arg.side, Number(arg.along))); // the crossing map
@@ -110,7 +111,7 @@ function setupIpc(ctx) {
   handle('checkUpdates', () => ctx.updates.check(true));
   handle('openUpdate', () => ctx.updates.open());
   handle('openLink', (key) => (key === 'logs' ? require('../shared/applog.js').open() : Object.hasOwn(LINKS, key) && shell.openExternal(LINKS[key]))); // About page: only its own links, and the log folder
-  handle('setMonitor', (partial) => change('monitor', partial, () => screen.applyAudio()));
+  handle('setMonitor', (partial) => change('monitor', partial, () => { screen.applyAudio(); pcScreen.apply(); })); // apply(): Playback › Steady takes a new session (pcscreen.js)
   handle('setClipboard', (partial) => change('clipboard', partial, () => clip.applySettings()));
   handle('copyHistory', (index) => clip.copyHistory(Number(index)));
   handle('clearHistory', () => clip.clearHistory());
@@ -220,6 +221,7 @@ function setupIpc(ctx) {
   handle('removeShare', () => smb.unshare());
   handle('openMacDrive', () => (smb.drive ? shell.openPath(smb.drive + '\\') : smb.openOverWifi && smb.openOverWifi())); // through Bluetooth: Wi-Fi Direct first
   handle('cancelDrop', () => fileDrop.cancel());
+  handle('clearFiles', () => ctx.clearFiles && ctx.clearFiles());
   // With another PC the apps come through peerapps.js (no Monitor 2 or Start pinning).
   const pcPeer = () => link.peerOs !== P.OS.MAC; // a PC or a Linux computer
   handle('listApps', () => (pcPeer() ? peerApps.refresh() : apps.refresh()));
@@ -299,9 +301,14 @@ function setupIpc(ctx) {
   // pairsync.js applies a value the other computer changed, with the same side effects.
   const AFTER = {
     clipboard: () => clip.applySettings(),
-    monitor: () => screen.applyAudio(), // pacing (pair.sync 'pace')
+    monitor: () => { screen.applyAudio(); pcScreen.apply(); }, // pacing (pair.sync 'pace'); Steady: a new session
     notifs: () => notifs.applySettings(),
-    audio: () => sound.apply(),
+    audio: () => { // pair.sync: the sound, and a phone's microphone (its Audio page's switch)
+      sound.apply();
+      const mic = ctx.loadMic && ctx.loadMic();
+      if (mic) mic.apply();
+      if (ctx.phone && ctx.phone.bridge && ctx.phone.bridge._sound) ctx.phone.bridge._sound();
+    },
     kvm: () => kvm.applyConfig(),
     pcApps: () => { pcApps.apply(); pcApps.input.release(); },
     rezume: () => (ctx.rezume ? ctx.rezume.apply() : ctx.loadReZume()),

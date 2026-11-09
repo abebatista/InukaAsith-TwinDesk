@@ -78,7 +78,13 @@ class Core private constructor(val ctx: Context) : Link.Events {
     val nowPlaying = NowPlaying(this) // what plays here, for the computer's media controls
     val rezume = Rezume(this) // ReZume: go on with what's in use on the other device (off until turned on)
     val dev = DevCtl(this) // this phone's controls on the computer's Overview, the computer's on the Computer page
-    private val features: List<Feature> = listOf(net, sync, clip, notifs, files, fclip, info, apps, wake, adb, pointer, input, drive, screen, macSound, shortcuts, kvm, remote, hub, share, sound, mirror, shots, nowPlaying, rezume, dev)
+    val appList = AppList(this) // the phone's apps, for the pages that pick some (Notifications, Banking apps)
+    val bank = BankGuard(this) // a banking app opened: debugging off, and TwinDesk exits (General › Banking apps)
+    val pcMedia = PcMedia(this) // what plays on the computer: the Media page and a media notification here
+    // Connect with Android: another phone, on a session of its own beside the computer's (Peer.kt).
+    // Not a Feature: the computer's messages never reach it, nor its the computer.
+    val peer = Peer(this)
+    private val features: List<Feature> = listOf(net, sync, clip, notifs, files, fclip, info, apps, wake, adb, pointer, input, drive, screen, macSound, shortcuts, kvm, remote, hub, share, sound, mirror, shots, nowPlaying, rezume, dev, pcMedia)
 
     val host: Host? get() = if (link.connected) link.host else null
 
@@ -90,11 +96,54 @@ class Core private constructor(val ctx: Context) : Link.Events {
         if (started || store.flag("exited", false)) return
         started = true
         discovery.start()
+        runCatching { peer.start() }.onFailure { Log.e("TwinDesk", "peer", it) }
         Notify.channels(ctx)
         updates.start()
         if (store.flag("remote.btpad", false)) btPad.start()
+        runCatching { bank.start() }.onFailure { Log.e("TwinDesk", "bank", it) }
         bg.scheduleWithFixedDelay({ runCatching { bleTick() }.onFailure { Log.e("TwinDesk", "ble", it) } }, 2, 2, TimeUnit.SECONDS)
+        // Quiet links (Link.kt, shared/quiet.js, #143): what keeps the session pinging every second.
+        // Clipboard, notifications and cursor sharing switched on don't: their messages go when
+        // something happens, and a message makes the link active at once.
+        link.keepPinging = performance
+        link.busyHere = {
+            screen.viewing || adb.viewed || remote.active || files.moving || mirror.wanted || sound.wanted || SoundService.running != null ||
+                MainActivity.shown
+        }
+        // The screen came on or the phone was unlocked: look at the session now (a dead one is found
+        // within seconds instead of at the next quiet ping).
+        runCatching {
+            ctx.registerReceiver(object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context, i: android.content.Intent) { link.wake() }
+            }, android.content.IntentFilter().apply { addAction(android.content.Intent.ACTION_SCREEN_ON); addAction(android.content.Intent.ACTION_USER_PRESENT) })
+        }
     }
+
+    // General › Connections › Prioritize performance over battery life (off): on, the session pings
+    // every second even when nothing is in use (as before); off, an idle one goes quiet.
+    var performance: Boolean
+        get() = store.flag("performance", false)
+        set(on) { store.setFlag("performance", on); link.keepPinging = on; changed() }
+
+    // General › Connections › Reconnect in the background (on): a session that dropped by accident is
+    // taken up again with TwinDesk closed. Off: only once TwinDesk is opened (foreground()).
+    var reconnectBg: Boolean
+        get() = store.flag("reconnectBg", true)
+        set(on) { store.setFlag("reconnectBg", on); changed() }
+    @Volatile private var resumeLater: Host? = null
+
+    // MainActivity on screen: a session put off by Reconnect in the background, and a look at the
+    // current one.
+    fun foreground() {
+        link.wake()
+        val h = resumeLater ?: return
+        resumeLater = null
+        if (link.connected || link.state == "connecting" || link.pair != null || peer.connected) return
+        val known = store.hosts().find { it.id == h.id } ?: return
+        Log.i("TwinDesk", "opened: reconnecting to ${known.name}")
+        bg.execute { connect(known) }
+    }
+    private fun inBackground() = !reconnectBg && !MainActivity.shown
 
     // Every 2 s: Bluetooth scans while it may be needed (not connected, or connected through it),
     // and a session through Bluetooth moves onto the network as soon as the computer is seen there
@@ -113,7 +162,7 @@ class Core private constructor(val ctx: Context) : Link.Events {
         val want = bleOn && ble.allowed() && ble.radioOn && (!link.connected || link.ble)
         ble.scan(want)
         if (!bleOn && ble.found.isNotEmpty()) ble.stop()
-        serve.advertise(bleOn && serve.allowed() && ble.radioOn && !link.connected)
+        serve.advertise(bleOn && serve.allowed() && ble.radioOn && !link.connected && !peer.connected) // a phone holds the session: computers wait
         if (!bleOn && serve.found.isNotEmpty()) serve.stop()
         val h = link.host
         if (link.connected && !link.ble) screen.onWifi()
@@ -139,11 +188,18 @@ class Core private constructor(val ctx: Context) : Link.Events {
     // save adds 50–200 ms bursts).
     private val wifiFast by lazy { WifiFast(ctx) }
 
+    // General › Run in the background (on by default): connected with the app closed, and started with
+    // the phone. Off: only while the app is open (swiping it away stops TwinDesk, as Exit does).
+    var background: Boolean
+        get() = store.flag("background", true)
+        set(on) { store.setFlag("background", on); changed() }
+
     fun changed() {
         // (runCatching: discovery may report before every feature exists)
         runCatching { wifiFast.hold(link.connected && !link.wired && (screen.viewing || adb.viewed || remote.active)) }
+        runCatching { link.nudge() } // a hold started or ended: the computer hears within a tick
         version.value++
-        main.post { TwinService.refresh(ctx) }
+        main.post { TwinService.refresh(ctx); if (started) bank.checkSoon() }
     }
 
     // Through Bluetooth, files wait for Wi-Fi (Netlink.holdOut).
@@ -184,7 +240,7 @@ class Core private constructor(val ctx: Context) : Link.Events {
     // it now, an unpaired one is shown as an invite (Pair asks it for a pipe again).
     private fun onServeOpen(f: Found, port: Int): Boolean {
         val h = store.hosts().find { it.id == f.id }
-        if (h == null || link.connected || link.state == "connecting" || link.pair != null) {
+        if (h == null || link.connected || link.state == "connecting" || link.pair != null || peer.connected) {
             if (h == null) onInvite(f.copy(invited = true))
             return false
         }
@@ -198,6 +254,7 @@ class Core private constructor(val ctx: Context) : Link.Events {
     // WiredReceiver): take the session through the cable, also from a Wi-Fi session with it. Not
     // paired with it yet: pair through the cable (no Wi-Fi needed), then the session follows.
     fun connectWired(id: String, port: Int, nonce: String, name: String) {
+        if (peer.connected) { Log.i("TwinDesk", "USB: ${name.ifEmpty { id }} found, but another phone is connected"); return }
         val h = store.hosts().find { it.id == id }
         if (h == null) {
             if (link.pair != null && link.pair?.phase != "failed") { Log.i("TwinDesk", "USB: already pairing"); return }
@@ -292,6 +349,8 @@ class Core private constructor(val ctx: Context) : Link.Events {
     private fun onInvite(f: Found) {
         val h = store.hosts().find { it.id == f.id }
         if (h != null) {
+            // A phone holds the session (one at a time): the computer waits; Connect here takes it back.
+            if (peer.connected) { Log.i("TwinDesk", "invite from ${f.name}: a phone holds the session"); return }
             Log.i("TwinDesk", "invite from ${f.name}: connecting")
             if (link.host?.id == h.id && (link.state == "connected" || link.state == "connecting")) return
             if (!f.address.startsWith("ble:") && !f.address.startsWith("blp:")) {
@@ -319,6 +378,8 @@ class Core private constructor(val ctx: Context) : Link.Events {
         Log.i("TwinDesk", "session with ${host.name}")
         resumeUntil = 0
         Notify.cancelInvite(ctx)
+        // One session: a phone's ends (Peer.started ends ours the other way).
+        if (peer.connected) { Log.i("TwinDesk", "ending the phone session for ${host.name}"); peer.disconnect() }
         // Tells the computer which of its USB devices this is (its screen and input use that one).
         if (link.wired) link.send(JSONObject().put("t", "phone.wired").put("nonce", wiredNonce))
         // Paired through the cable: its network address once discovery has seen it.
@@ -350,6 +411,7 @@ class Core private constructor(val ctx: Context) : Link.Events {
         // Dropped by accident (not let go, replaced, forgotten or closed here): try to get it back.
         val accidental = code == null || code !in setOf("local", Proto.E.RELEASED, Proto.E.REPLACED, Proto.E.BAD_TOKEN, Proto.E.BUSY, Proto.E.ASLEEP)
         if (!accidental || link.state == "failed") return
+        if (inBackground()) { resumeLater = host; Log.i("TwinDesk", "dropped in the background: reconnecting when TwinDesk opens"); return }
         if (resumeUntil == 0L) resumeUntil = System.currentTimeMillis() + Proto.PHONE_GRACE_MS
         resumeHost = host
         bg.schedule({ resume() }, 1500, TimeUnit.MILLISECONDS)
@@ -359,7 +421,8 @@ class Core private constructor(val ctx: Context) : Link.Events {
 
     private fun resume() {
         val h = resumeHost ?: return
-        if (System.currentTimeMillis() > resumeUntil || link.connected || link.state == "connecting" || link.pair != null) return
+        if (System.currentTimeMillis() > resumeUntil || link.connected || link.state == "connecting" || link.pair != null || peer.connected) return
+        if (inBackground()) { resumeLater = h; return }
         Log.i("TwinDesk", "resuming the session with ${h.name}")
         val until = resumeUntil
         connect(store.hosts().find { it.id == h.id } ?: return, triedNet)

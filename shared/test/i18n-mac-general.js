@@ -28,7 +28,9 @@ function render(locale) {
     switch: (change, options) => ({ change, ...options, set(value) { this.value = value; }, disable() {} }),
     select: (options, change) => el('select', { options, change, set(value) { this.value = value; } }),
     mediaControlsRow: () => ({ el: el('media'), update() {} }),
+    enginesRows: () => ({ rows: [], update() {} }), // shared/ui-engines.js
     // shared/ui-look.js
+    styleRow: () => Object.assign(el('row'), { render() {} }),
     themeRow: () => Object.assign(el('row'), { render() {} }),
     accentRow: () => Object.assign(el('row'), { render() {} }),
     sections: (cards) => Object.assign(el('sections', {}, cards), { spy() {} }),

@@ -75,7 +75,7 @@ fun WirelessGuide(core: Core, ctx: Context, v: Int) {
                 Tile(Ico.display, listOf(Color(0xFF5AC8FA), Color(0xFF0A84FF)), 44)
                 Column(Modifier.padding(start = 14.dp)) {
                     Text("Wireless debugging", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = pal.text)
-                    Text("Set up once so $name can show this screen and control it with its mouse and keyboard", color = pal.muted, fontSize = 13.5.sp)
+                    Text("A one-time setup so $name can show this screen and control it with a mouse and keyboard", color = pal.muted, fontSize = 13.5.sp)
                 }
             }
             Spacer(Modifier.height(20.dp))
@@ -94,7 +94,7 @@ fun WirelessGuide(core: Core, ctx: Context, v: Int) {
 // with its hint and button, the rest as titles. The code field is for Settings side by side.
 @Composable
 private fun WirelessSteps(core: Core, ctx: Context, title: String, foot: @Composable () -> Unit = {}) {
-    @Suppress("UNUSED_VARIABLE") val v by core.version.collectAsState() // redraw on Core changes (Compose skips it otherwise: same core)
+    @Suppress("UNUSED_VARIABLE") val v = core.version.collectAsState().value // redraw on Core changes (Compose skips it otherwise: same core); read here, so it subscribes
     val a = core.adb
     val name = core.host?.name ?: core.hosts().firstOrNull()?.name ?: "your computer"
     val connected = core.host != null
@@ -145,7 +145,7 @@ private fun WirelessSteps(core: Core, ctx: Context, title: String, foot: @Compos
             Box(Modifier.fillMaxWidth().height(1.dp).background(pal.line))
             Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    code, { code = it.filter { c -> c.isDigit() }.take(6) }, placeholder = { Text("Or enter the code here", color = pal.faint, fontSize = 14.sp) }, singleLine = true,
+                    code, { code = it.filter { c -> c.isDigit() }.take(6) }, placeholder = { Text("Or enter the code", color = pal.faint, fontSize = 14.sp) }, singleLine = true,
                     modifier = Modifier.weight(1f), shape = RoundedCornerShape(8.dp),
                     textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp, color = pal.text, letterSpacing = 3.sp),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),

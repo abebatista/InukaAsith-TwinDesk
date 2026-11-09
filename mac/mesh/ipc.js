@@ -19,7 +19,7 @@ const SETTINGS_URLS = {
   location: 'x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices',
   extensions: 'x-apple.systempreferences:com.apple.ExtensionsPreferences?Sharing',
 };
-const TABS = ['phone', 'overview', 'connection', 'mirror', 'papps', 'calls', 'messages', 'media', 'pfiles', 'share', 'receive', 'cursor', 'keyboard', 'clipboard', 'notifications', 'files', 'mount', 'terminal', 'audio', 'apps', 'multi', 'general', 'about'];
+const TABS = ['phone', 'overview', 'connection', 'mirror', 'papps', 'calls', 'messages', 'media', 'pfiles', 'share', 'receive', 'cursor', 'keyboard', 'clipboard', 'notifications', 'files', 'mount', 'terminal', 'audio', 'apps', 'multi', 'web', 'airplay', 'general', 'about'];
 
 const bool = (v) => !!v;
 const clamp = (lo, hi, dflt) => (v) => {
@@ -40,7 +40,7 @@ const SCHEMA = {
     resistancePx: (v) => Math.round(clamp(0, 400, 120)(v)), speed: clamp(0.25, 4, 1), reverseScroll: bool, hotkeySwitch: bool, linked: bool, gestures: bool, ble: bool, syncPads: bool, shakeHome: bool,
   },
   keys: { swapCtrlCmd: bool, hotkey: oneOf(P.HOTKEYS, 'AltRight'), lockKeys: (v) => CL.validKeys(v, CL.DEFAULT_KEYS.mac) },
-  app: { openAtLogin: bool, keepAwake: bool, hud: bool, inputProtocol: oneOf(['udp', 'tcp'], 'udp') },
+  app: { openAtLogin: bool, keepAwake: bool, hud: bool, inputProtocol: oneOf(['udp', 'tcp'], 'udp'), keepPinging: bool },
   mesh: { autoJoin: bool },
   updates: { auto: bool, skipped: (v) => (typeof v === 'string' ? v.slice(0, 40) : '') },
   audio: { send: bool, receive: bool, muteLocal: bool, volume: clamp(0, 1, 1), phoneMedia: bool, micSend: bool, micReceive: bool, micDevice: devId, micOut: devId }, // mic*: shared/mic.js
@@ -50,7 +50,7 @@ const SCHEMA = {
   smb: { connectPc: bool },
   apps: { offer: bool, onVirtual: bool, moveWindows: bool, moveKey: oneOf(['ControlRight', 'ControlLeft', 'ShiftRight', 'ShiftLeft', 'AltRight', 'AltLeft', 'MetaRight', 'MetaLeft'], 'MetaRight') }, // moveWindows: Apps › Move windows (movewin.js)
   receive: { on: bool, fullScreen: bool, input: bool, framegen: bool },
-  sharing: { remote: bool, pace: oneOf(['fast', 'smooth'], 'fast') },
+  sharing: { remote: bool, pace: oneOf(['fast', 'smooth', 'steady'], 'fast'), fps: oneOf([0, 30, 60], 0) },
   papps: { on: bool },
   phone: { sound: bool, bitrateMbps: (v) => Math.round(clamp(2, 40, 8)(v)), maxSize: oneOf([0, 1920, 1600, 1280, 1024], 0), wallpaper: bool, input: oneOf(['adb', 'phone'], 'adb'), inputPicked: bool, enterSends: bool, arrowSwipe: bool },
   mount: { on: bool },
@@ -160,7 +160,7 @@ function setupIpc(ctx) {
     },
     // Disconnect the session (phone or computer); Connect again / Take over the Mac we're a guest of.
     disconnect() {
-      if (ctx.server.current && ctx.server.current.os === P.OS.ANDROID) return ctx.phone.disconnect();
+      if (ctx.server.current && P.isPhoneOs(ctx.server.current.os)) return ctx.phone.disconnect();
       ctx.server.disconnect();
     },
     connectAgain() {
@@ -284,8 +284,11 @@ function setupIpc(ctx) {
     },
     // Who may start our sharing, and smoothness vs. sharpness.
     setSharingOpts(partial) {
+      const was = { steady: settings.sharing.pace === 'steady', fps: settings.sharing.fps || 0 };
       setGroup('sharing', partial);
       ctx.pcView.applySettings(); // playback pace in the open viewer
+      // Steady is set up per session (the viewer's answer), the frame rate too: a new one.
+      if (ctx.stream && ctx.stream.active && (was.steady !== (settings.sharing.pace === 'steady') || was.fps !== (settings.sharing.fps || 0))) ctx.stream.restart('playback changed');
     },
     // Start/stop the other computer's sharing or switch its Extend/Mirror from here.
     remoteScreen(arg) {
@@ -411,6 +414,10 @@ function setupIpc(ctx) {
     },
     revealDrop(index) {
       ctx.drop.reveal(Number(index));
+    },
+    clearFiles() {
+      ctx.drop.clearRecent();
+      if (ctx.fileSend) ctx.fileSend.clearRecent();
     },
     setSmb(partial) {
       setGroup('smb', partial);
@@ -585,10 +592,11 @@ function setupIpc(ctx) {
       if (r && typeof r === 'object' && r.chat) return void ((ctx.chats && ctx.chats()) && (ctx.chats && ctx.chats()).reply(String(r.chat), r.text, r.image)); // a chat app's conversation (shared/chats.js)
       if (r && typeof r === 'object' && ctx.notifs && ctx.notifs.reply) ctx.notifs.reply(String(r.id || ''), r.text);
     },
-    // General › Appearance: { theme } and/or { accent } ('' follows the system); local only.
+    // General › Appearance: { style }, { theme } and/or { accent } ('' follows the system); local only.
     setLook(o) {
       if (!o || typeof o !== 'object') return;
       const Look = require('../../shared/look.js');
+      if (typeof o.style === 'string') settings.ui.style = Look.style(o.style);
       if (typeof o.theme === 'string') settings.ui.theme = Look.theme(o.theme);
       if (typeof o.accent === 'string') settings.ui.accent = Look.accent(o.accent);
       store.saveSettings(settings);

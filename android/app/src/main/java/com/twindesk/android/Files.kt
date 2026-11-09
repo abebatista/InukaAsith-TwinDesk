@@ -11,6 +11,10 @@
 // (a third more on the wire, and slower): we PUT what we send, and GET what the computer sends when it
 // says file.pull. Anything wrong before a byte went: that file, and the rest of the session's, go as
 // file.chunk. An older computer gives no token, so it gets file.chunk as before.
+// Fast files v2 (Fx2.kt), with a computer whose files engine is there (welcome {fx2}) and not through
+// the cable: a big file as 4 ranges at once, both ways, the ranges' hashes in file.end. Anything wrong
+// before a byte went: that file and the rest of the session's go the fx way (fx2Broken). On a Wi-Fi
+// Direct group or a hotspot made for the files, the bytes keep it up (Netlink.touch), as chunks do.
 package com.twindesk.android
 
 import android.content.ContentValues
@@ -49,6 +53,8 @@ class Files(core: Core) : Feature(core) {
         var pulling = false
         var heldEnd: JSONObject? = null
         @Volatile var stop: (() -> Unit)? = null // cancels the GET
+        // fx2: the ranges' hashes once every one is in (file.end {fx2} must match them).
+        @Volatile var fx2Hashes: List<String>? = null
     }
 
     class Batch(val id: String, val kind: String, val count: Int, val bytes: Long, val target: Target) {
@@ -74,10 +80,14 @@ class Files(core: Core) : Feature(core) {
     }
 
     private val awake = Awake(core.ctx) // the phone stays awake while file bytes move
+    val moving: Boolean get() = awake.busy
     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "td-files-in").apply { isDaemon = true } }
     private val pump = Executors.newSingleThreadExecutor { r -> Thread(r, "td-files-out").apply { isDaemon = true } }
     private val pulls = Executors.newCachedThreadPool { r -> Thread(r, "td-files-fx").apply { isDaemon = true } }
     @Volatile private var fxBroken = false // fast files failed before a byte went: file.chunk for the rest of the session
+    @Volatile private var fx2Broken = false // fx2 failed before a byte went: the fx way for the rest of the session
+    private val ranges = Executors.newCachedThreadPool { r -> Thread(r, "td-files-fx2").apply { isDaemon = true } }
+    private val progress = Any() // sentBytes from the ranges' threads
     private val incoming = ConcurrentHashMap<String, Incoming>()
     private val batches = ConcurrentHashMap<String, Batch>()
     private val expected = ConcurrentHashMap<String, Target>() // batch (fclip id) -> where a paste we asked for goes
@@ -85,6 +95,36 @@ class Files(core: Core) : Feature(core) {
     private val outBatches = ConcurrentHashMap<String, OutBatch>()
     val recent = java.util.concurrent.CopyOnWriteArrayList<String>() // newest first, one line each
     private val drags = ConcurrentHashMap<String, Int>() // drag id -> files announced (drag.start)
+    private val dropped = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>()) // batches cancelled here: the rest of their offers refused
+
+    // Cancel (the notification, the Files page): stops a batch either way. Each file gets file.cancel,
+    // which the computer already takes as cancelled here (as when one end disconnects).
+    fun cancel(batchId: String) = io.execute {
+        if (batchId.isEmpty()) return@execute
+        outBatches.remove(batchId)?.let { b ->
+            for (f in outgoing.filter { it.batch == batchId }) {
+                outgoing.remove(f) // its upload thread sees it gone and stops
+                core.send(msg(Proto.T.FILE_CANCEL, "id" to f.id))
+            }
+            Notify.cancelFiles(core.ctx, b.key)
+            recent.add(0, "Cancelled sending ${b.name}")
+            while (recent.size > 20) recent.removeAt(recent.size - 1)
+            core.changed()
+        }
+        batches[batchId]?.let { b ->
+            dropped.add(batchId)
+            for (f in incoming.values.filter { it.batch == batchId }) abort(f.id, "cancelled here", true)
+            while (batches[batchId] === b) fileFinished(b, false) // the files not offered yet: the batch ends now
+            Notify.cancelFiles(core.ctx, b.key)
+            recent[0] = "Cancelled receiving ${plural(b.count, "file")}"
+            core.changed()
+        }
+    }
+
+    fun clearRecent() {
+        recent.clear()
+        core.changed()
+    }
 
     fun expect(batch: String, target: Target) {
         expected[batch] = target
@@ -137,6 +177,7 @@ class Files(core: Core) : Feature(core) {
 
     override fun onWelcome(host: Host) {
         fxBroken = false
+        fx2Broken = false
         core.send(msg(Proto.T.DRAG_POLICY, "accept" to true)) // files dragged across the edge go to Downloads
     }
 
@@ -145,6 +186,7 @@ class Files(core: Core) : Feature(core) {
             for (id in incoming.keys.toList()) abort(id, "disconnected", false)
             for (b in batches.values) Notify.cancelFiles(core.ctx, b.key)
             batches.clear()
+            dropped.clear()
         }
         for (o in outgoing) cancelOut(o.id)
         outBatches.clear()
@@ -170,6 +212,7 @@ class Files(core: Core) : Feature(core) {
         val size = m.optLong("size", -1)
         if (size < 0 || size > Proto.FILE_MAX_BYTES) return refuse(id, "too_big")
         val batchId = (if (drop == "drag") m.optString("drag") else m.optString("batch")).ifEmpty { id }
+        if (batchId in dropped) return refuse(id, "cancelled")
         val rel = m.optString("rel").ifEmpty { m.optString("name") }.split('/').filter { it.isNotEmpty() }.map(::cleanSegment)
         if (rel.isEmpty()) return refuse(id, "bad_name")
         var batch = batches[batchId]
@@ -234,7 +277,8 @@ class Files(core: Core) : Feature(core) {
         if (f.pulling) { f.heldEnd = m; return } // the GET is still bringing the last bytes
         incoming.remove(f.id)
         val batch = batches[f.batch]
-        val ok = f.got == f.size && f.hash.digest().hex() == m.optString("sha256")
+        val h2 = f.fx2Hashes
+        val ok = f.got == f.size && if (h2 != null) Fx2.same(m.optJSONArray("fx2"), h2) else f.hash.digest().hex() == m.optString("sha256")
         runCatching { f.out.close() }
         if (!ok) {
             f.uri?.let { runCatching { core.ctx.contentResolver.delete(it, null, null) } }
@@ -269,7 +313,7 @@ class Files(core: Core) : Feature(core) {
     // {failed} when we can't, and the computer sends it as file.chunk.
     private fun pull(m: JSONObject) {
         val id = m.optString("id")
-        if (m.has("fx2")) { core.send(msg(Proto.T.FILE_PULL, "id" to id, "failed" to true, "fx2" to 1)); return } // never asked for
+        if (m.has("fx2")) return pull2(id, m.optLong("size", -1))
         val f = incoming[id]
         val fx = if (fxBroken) null else core.link.fx()
         if (f == null || fx == null || f.pulling || f.got > 0 || f.seq > 0) { core.send(msg(Proto.T.FILE_PULL, "id" to id, "failed" to true)); return }
@@ -324,8 +368,132 @@ class Files(core: Core) : Feature(core) {
         }
     }
 
+    // ---- fx2: in ----
+
+    // file.pull {fx2, size}: GET its ranges at once, each written at its offset. Answered {failed,
+    // fx2} when we can't (before a byte): the computer sends it the fx way.
+    private fun pull2(id: String, size: Long) {
+        val f = incoming[id]
+        val fx = if (fxBroken || fx2Broken) null else core.link.fx()
+        val port = fx?.let { if (it.plain != null && it.plain.fx2Port > 0) it.plain.fx2Port else it.fx2Port } ?: 0
+        if (f == null || fx == null || port == 0 || f.pulling || f.got > 0 || f.seq > 0 || size != f.size) {
+            core.send(msg(Proto.T.FILE_PULL, "id" to id, "failed" to true, "fx2" to 1))
+            return
+        }
+        f.pulling = true
+        pulls.execute { download2(f, fx, port) }
+    }
+
+    // Writes at offsets into the file the offer opened: a second descriptor on it (the stream the
+    // offer opened writes nothing then, and closing it truncates nothing).
+    private fun positional(f: Incoming): Pair<java.nio.channels.FileChannel, java.io.Closeable> {
+        if (f.uri != null) {
+            val pfd = core.ctx.contentResolver.openFileDescriptor(f.uri, "rw") ?: throw IOException("can’t open it")
+            return java.io.FileOutputStream(pfd.fileDescriptor).channel to pfd
+        }
+        val raf = java.io.RandomAccessFile(f.file!!, "rw")
+        return raf.channel to raf
+    }
+
+    private fun download2(f: Incoming, fx: Link.Fx, port: Int) {
+        val plan = Fx2.plan(f.size)
+        val got = java.util.concurrent.atomic.AtomicLong(0)
+        val dead = java.util.concurrent.atomic.AtomicBoolean(false)
+        val stops = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+        // A range's socket or call: closed when the file stops (one at once when it already has).
+        val stopWith: (() -> Unit) -> Unit = { s -> stops.add(s); if (dead.get()) runCatching { s() } }
+        val stopAll = { dead.set(true); for (s in stops) runCatching { s() } }
+        f.stop = stopAll
+        var error: String? = null
+        val hashes = arrayOfNulls<String>(plan.size)
+        var opened: Pair<java.nio.channels.FileChannel, java.io.Closeable>? = null
+        try {
+            val (ch, _) = positional(f).also { opened = it }
+            val jobs = plan.map { r ->
+                ranges.submit<String> {
+                    val md = MessageDigest.getInstance("SHA-256")
+                    var pos = r.off
+                    var left = r.len
+                    val path = Fx2.path(f.id, r, f.size)
+                    val body: java.io.InputStream = if (fx.plain != null && fx.plain.fx2Port > 0) {
+                        if (dead.get()) throw IOException("stopped")
+                        val b = FxHttp.get(fx.address, port, path, fx.plain.token) { sock -> stopWith { sock.close() }; if (incoming[f.id] !== f) sock.close() }
+                        if (b.code != 200) { b.close(); throw IOException("HTTP ${b.code}") }
+                        b
+                    } else {
+                        val h = if (fx.address.contains(':')) "[${fx.address}]" else fx.address
+                        if (dead.get()) throw IOException("stopped")
+                        val call = fx.client.newCall(Request.Builder().url("https://$h:$port$path").header(Proto.FX_HEADER, fx.token).build())
+                        stopWith { call.cancel() }
+                        if (incoming[f.id] !== f) call.cancel()
+                        val res = call.execute()
+                        if (res.code != 200) { res.close(); throw IOException("HTTP ${res.code}") }
+                        res.body.byteStream()
+                    }
+                    body.use { s ->
+                        val buf = ByteArray(256 * 1024)
+                        var unsent = 0L
+                        while (true) {
+                            val n = s.read(buf)
+                            if (n < 0) break
+                            if (incoming[f.id] !== f || dead.get()) throw IOException("cancelled")
+                            if (n > left) throw IOException("more than offered")
+                            val bb = java.nio.ByteBuffer.wrap(buf, 0, n)
+                            while (bb.hasRemaining()) pos += ch.write(bb, pos)
+                            md.update(buf, 0, n)
+                            left -= n
+                            got.addAndGet(n.toLong())
+                            unsent += n
+                            if (unsent >= 1024 * 1024) { val d = unsent; unsent = 0; io.execute { gotBytes(f, d) } }
+                        }
+                        if (unsent > 0) { val d = unsent; io.execute { gotBytes(f, d) } }
+                    }
+                    if (left != 0L) throw IOException("the transfer stopped")
+                    md.digest().hex()
+                }
+            }
+            for ((i, j) in jobs.withIndex()) {
+                try {
+                    hashes[i] = j.get()
+                } catch (e: java.util.concurrent.ExecutionException) {
+                    stopAll() // the other ranges stop too
+                    for (k in jobs) runCatching { k.get() } // … and write nothing more (the fx way may follow)
+                    throw (e.cause ?: e)
+                }
+            }
+            ch.force(false)
+        } catch (e: Throwable) {
+            error = e.message ?: "transfer failed"
+        } finally {
+            opened?.let { runCatching { it.second.close() } }
+        }
+        val wrote = got.get() > 0
+        io.execute {
+            if (error == null) {
+                f.got = f.size
+                f.fx2Hashes = hashes.map { it!! }
+            }
+            pulled2(f, error, wrote)
+        }
+    }
+
+    private fun pulled2(f: Incoming, error: String?, wrote: Boolean) {
+        f.pulling = false
+        f.stop = null
+        if (incoming[f.id] !== f) return // cancelled meanwhile
+        if (error != null) {
+            Log.w("TwinDesk", "fast file (fx2) ${f.name}: $error")
+            if (wrote) return abort(f.id, error, true)
+            fx2Broken = true
+            core.send(msg(Proto.T.FILE_PULL, "id" to f.id, "failed" to true, "fx2" to 1)) // nothing came: the computer sends it the fx way
+            return
+        }
+        f.heldEnd?.let { f.heldEnd = null; end(it) }
+    }
+
     private fun gotBytes(f: Incoming, n: Long) {
         awake.touch()
+        core.net.touch("files") // a Wi-Fi Direct group made for files stays up while they move
         batches[f.batch]?.let { it.got += n; note(it, false) }
     }
 
@@ -358,11 +526,11 @@ class Files(core: Core) : Feature(core) {
         if (b.target.onDone != null) {
             Notify.cancelFiles(core.ctx, b.key)
             b.target.onDone.invoke(b)
-            if (b.target.where.isNotEmpty()) Notify.files(core.ctx, b.key, if (b.ok) "$what from $from" else "Not everything arrived from $from", "In ${b.target.where}", null, null)
+            if (b.target.where.isNotEmpty()) Notify.files(core.ctx, b.key, if (b.ok) "$what from $from" else "Some files didn’t arrive from $from", "In ${b.target.where}", null, null)
         } else {
             val open = if (b.placed.size == 1) Notify.viewIntent(b.placed[0].first, b.placed[0].second)
             else Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            Notify.files(core.ctx, b.key, if (b.ok) "$what from $from" else "Not everything arrived from $from", if (b.ok) "In Downloads › TwinDesk. Tap to open." else "$what is incomplete", null, open)
+            Notify.files(core.ctx, b.key, if (b.ok) "$what from $from" else "Some files didn’t arrive from $from", if (b.ok) "In Downloads › TwinDesk. Tap to open." else "$what is incomplete", null, open)
         }
         core.changed()
     }
@@ -372,7 +540,7 @@ class Files(core: Core) : Feature(core) {
         if (!force && now - b.lastNote < 500) return
         b.lastNote = now
         if (b.target.onDone != null && b.target.where.isEmpty()) Notify.fclipProgress(core.ctx, "Copying ${plural(b.count, "file")} from ${core.host?.name ?: "your computer"}", pct(b.got, b.bytes))
-        else Notify.files(core.ctx, b.key, "Receiving ${plural(b.count, "file")} from ${core.host?.name ?: "your computer"}", "${pct(b.got, b.bytes)}%", pct(b.got, b.bytes), null)
+        else Notify.files(core.ctx, b.key, "Receiving ${plural(b.count, "file")} from ${core.host?.name ?: "your computer"}", "${pct(b.got, b.bytes)}%", pct(b.got, b.bytes), null, cancel = b.id)
         core.changed()
     }
 
@@ -417,6 +585,28 @@ class Files(core: Core) : Feature(core) {
             val f = outgoing.firstOrNull { it.state == "accepted" } ?: return
             f.state = "sending"
             val fx = if (fxBroken) null else core.link.fx()
+            val port2 = fx?.let { if (it.plain != null && it.plain.fx2Port > 0) it.plain.fx2Port else it.fx2Port } ?: 0
+            if (fx != null && port2 > 0 && !fx2Broken) {
+                val hashes = try {
+                    upload2(f, fx, port2)
+                } catch (e: NotSeekable) {
+                    null // this file can't be read at offsets: the fx way, this file only
+                } catch (e: Early) {
+                    Log.w("TwinDesk", "fast file (fx2) ${f.name}: ${e.message}: the fx way for this session")
+                    fx2Broken = true
+                    null
+                } catch (e: Exception) {
+                    Log.w("TwinDesk", "send ${f.name}: ${e.message}")
+                    core.send(msg(Proto.T.FILE_CANCEL, "id" to f.id))
+                    outgoing.remove(f)
+                    continue
+                }
+                if (hashes != null) {
+                    core.send(msg(Proto.T.FILE_END, "id" to f.id, "sha256" to Fx2.joined(hashes), "fx2" to org.json.JSONArray(hashes)))
+                    outgoing.remove(f)
+                    continue
+                }
+            }
             if (fx != null) {
                 val sha = try {
                     upload(f, fx)
@@ -461,6 +651,78 @@ class Files(core: Core) : Feature(core) {
     }
 
     private class Early(message: String) : IOException(message)
+    private class NotSeekable(message: String) : IOException(message)
+
+    // fx2: PUT its ranges at once, each read at its offset; the ranges' hashes for file.end.
+    // Early: nothing went. NotSeekable: this file can't be read at offsets (a stream, not a file).
+    private fun upload2(f: Outgoing, fx: Link.Fx, port: Int): List<String> {
+        val pfd = runCatching { core.ctx.contentResolver.openFileDescriptor(f.uri, "r") }.getOrNull() ?: throw NotSeekable("no descriptor")
+        pfd.use {
+            val ch = java.io.FileInputStream(pfd.fileDescriptor).channel
+            val len = runCatching { ch.size() }.getOrDefault(-1L)
+            if (len != f.size) throw NotSeekable("not a file of its size")
+            val plan = Fx2.plan(f.size)
+            val sent = java.util.concurrent.atomic.AtomicLong(0)
+            val dead = java.util.concurrent.atomic.AtomicBoolean(false)
+            val stops = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+            val stopWith: (() -> Unit) -> Unit = { s -> stops.add(s); if (dead.get()) runCatching { s() } }
+            val jobs = plan.map { r ->
+                ranges.submit<String> {
+                    val md = MessageDigest.getInstance("SHA-256")
+                    val pumpTo: (java.io.OutputStream) -> Unit = { out ->
+                        val buf = ByteArray(256 * 1024)
+                        val bb = java.nio.ByteBuffer.wrap(buf)
+                        var pos = r.off
+                        val end = r.off + r.len
+                        while (pos < end) {
+                            if (!outgoing.contains(f) || dead.get()) throw IOException("cancelled")
+                            bb.clear()
+                            bb.limit(minOf(buf.size.toLong(), end - pos).toInt())
+                            val n = ch.read(bb, pos)
+                            if (n < 0) throw IOException("the file shrank")
+                            md.update(buf, 0, n)
+                            out.write(buf, 0, n)
+                            pos += n
+                            sent.addAndGet(n.toLong())
+                            synchronized(progress) { sentBytes(f, n) }
+                        }
+                    }
+                    val path = Fx2.path(f.id, r, f.size)
+                    if (dead.get()) throw IOException("stopped")
+                    val code = if (fx.plain != null && fx.plain.fx2Port > 0) {
+                        FxHttp.put(fx.address, port, path, fx.plain.token, r.len, { sock -> stopWith { sock.close() } }, pumpTo)
+                    } else {
+                        val body = object : RequestBody() {
+                            override fun contentType() = "application/octet-stream".toMediaType()
+                            override fun contentLength() = r.len
+                            override fun isOneShot() = true
+                            override fun writeTo(sink: BufferedSink) = pumpTo(sink.outputStream())
+                        }
+                        val h = if (fx.address.contains(':')) "[${fx.address}]" else fx.address
+                        val call = fx.client.newCall(Request.Builder().url("https://$h:$port$path").header(Proto.FX_HEADER, fx.token).put(body).build())
+                        stopWith { call.cancel() }
+                        call.execute().use { it.code }
+                    }
+                    if (code != 200) throw IOException("HTTP $code")
+                    md.digest().hex()
+                }
+            }
+            val out = arrayOfNulls<String>(plan.size)
+            for ((i, j) in jobs.withIndex()) {
+                try {
+                    out[i] = j.get()
+                } catch (e: java.util.concurrent.ExecutionException) {
+                    dead.set(true)
+                    for (s in stops) runCatching { s() } // the other ranges stop too
+                    for (k in jobs) runCatching { k.get() } // … and are done before the next file
+                    val why = e.cause?.message ?: "no answer"
+                    if (sent.get() == 0L && outgoing.contains(f)) throw Early(why)
+                    throw IOException(why)
+                }
+            }
+            return out.map { it!! }
+        }
+    }
 
     // PUT the file to the computer (fast files); its SHA-256 for file.end. Early: nothing went.
     private fun upload(f: Outgoing, fx: Link.Fx): String {
@@ -510,6 +772,7 @@ class Files(core: Core) : Feature(core) {
     private fun sentBytes(f: Outgoing, n: Int) {
         f.sent += n
         awake.touch()
+        core.net.touch("files") // a Wi-Fi Direct group made for files stays up while they move
         val b = outBatches[f.batch] ?: return
         b.sent += n
         val now = System.currentTimeMillis()
@@ -519,7 +782,8 @@ class Files(core: Core) : Feature(core) {
         // Over 5 MB: a notification with a live progress bar, as for files coming in.
         if (b.bytes > 5L * 1024 * 1024) {
             b.shown = true
-            Notify.files(core.ctx, b.key, "Sending ${b.name} to ${core.host?.name ?: "your computer"}", "${pct(b.sent, b.bytes)}%", pct(b.sent, b.bytes), null, up = true)
+            Notify.files(core.ctx, b.key, "Sending ${b.name} to ${core.host?.name ?: "your computer"}", "${pct(b.sent, b.bytes)}%", pct(b.sent, b.bytes), null, up = true, cancel = b.id)
+            if (outBatches[b.id] == null) Notify.cancelFiles(core.ctx, b.key) // cancelled meanwhile
         }
     }
 
@@ -531,7 +795,7 @@ class Files(core: Core) : Feature(core) {
         val b = outBatches.remove(m.optString("batch")) ?: return
         outgoing.removeIf { it.batch == b.id }
         val to = core.host?.name ?: "your computer"
-        if (b.shown) Notify.files(core.ctx, b.key, if (m.optBoolean("ok")) "Sent ${b.name}" else "Not everything arrived", "On $to", null, null, up = true)
+        if (b.shown) Notify.files(core.ctx, b.key, if (m.optBoolean("ok")) "Sent ${b.name}" else "Some files weren’t delivered", "On $to", null, null, up = true)
         recent.add(0, if (m.optBoolean("ok")) "Sent ${b.name} to $to" else "${b.name} didn’t all arrive on $to")
         while (recent.size > 20) recent.removeAt(recent.size - 1)
         core.changed()
