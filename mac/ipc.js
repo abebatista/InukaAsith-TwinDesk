@@ -51,7 +51,7 @@ const SCHEMA = {
   receive: { on: bool, fullScreen: bool, input: bool, framegen: bool },
   sharing: { remote: bool, pace: oneOf(['fast', 'smooth', 'steady'], 'fast'), codec: oneOf(['h264', 'h265'], 'h264'), fps: oneOf([0, 30, 60], 0) },
   papps: { on: bool },
-  phone: { sound: bool, bitrateMbps: (v) => Math.round(clamp(2, 40, 8)(v)), maxSize: oneOf([0, 1920, 1600, 1280, 1024], 0), wallpaper: bool, input: oneOf(['adb', 'phone'], 'adb'), inputPicked: bool, mirror: oneOf(['auto', 'adb', 'native'], 'auto'), soundVia: oneOf(['auto', 'adb', 'native'], 'auto'), enterSends: bool, arrowSwipe: bool },
+  phone: { sound: bool, bitrateMbps: (v) => Math.round(clamp(2, 40, 8)(v)), maxSize: oneOf([0, 1920, 1600, 1280, 1024], 0), wallpaper: bool, input: oneOf(['adb', 'phone'], 'adb'), inputPicked: bool, mirror: oneOf(['auto', 'adb', 'native'], 'auto'), soundVia: oneOf(['auto', 'adb', 'native'], 'auto'), enterSends: bool, arrowSwipe: bool, uhid: bool },
   mount: { on: bool },
   clipboard: {
     enabled: bool, send: bool, receive: bool, mode: oneOf(['switch', 'instant'], 'instant'),
@@ -459,6 +459,8 @@ function setupIpc(ctx) {
       if (typeof partial.ble === 'boolean') settings.net.ble = partial.ble;
       if (typeof partial.blePc === 'boolean') settings.net.blePc = partial.blePc;
       if (typeof partial.bleWifiOff === 'boolean') settings.net.bleWifiOff = partial.bleWifiOff; // blepolicy.js wifiQuiet
+      if (typeof partial.tailscale === 'boolean') settings.net.tailscale = partial.tailscale; // shared/tailnet.js
+      if (typeof partial.bleInput === 'boolean') settings.net.bleInput = partial.bleInput; // shared/bleinput.js
       save();
       ctx.ble.apply();
       if (partial.blePc === false && ctx.bleLook) ctx.bleLook.look(false); // computers off: stop looking now, not at the next tick
@@ -670,7 +672,7 @@ function setupIpc(ctx) {
     },
     relaunch() {
       app.relaunch();
-      app.exit(0);
+      app.quit(); // not exit: before-quit sends the cursor home and lets the helper release input
     },
     setMulti(on) {
       require('./multi').set(on === true); // Multi-device: TwinDesk restarts

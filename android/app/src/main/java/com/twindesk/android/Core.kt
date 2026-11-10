@@ -26,6 +26,7 @@ abstract class Feature(val core: Core) {
 
 class Core private constructor(val ctx: Context) : Link.Events {
     val store = Store(ctx)
+    init { I18n.init(ctx, store) }
     val version = MutableStateFlow(0)
     val bg = Executors.newScheduledThreadPool(2) { r -> Thread(r, "td-core").apply { isDaemon = true } }
     private val main = Handler(Looper.getMainLooper())
@@ -127,6 +128,10 @@ class Core private constructor(val ctx: Context) : Link.Events {
 
     // General › Connections › Reconnect in the background (on): a session that dropped by accident is
     // taken up again with TwinDesk closed. Off: only once TwinDesk is opened (foreground()).
+    // General › Tailscale (Tailnet.kt): on unless switched off.
+    var tailscale: Boolean
+        get() = store.flag("tailscale", true)
+        set(on) { store.setFlag("tailscale", on); changed() }
     var reconnectBg: Boolean
         get() = store.flag("reconnectBg", true)
         set(on) { store.setFlag("reconnectBg", on); changed() }
@@ -194,6 +199,14 @@ class Core private constructor(val ctx: Context) : Link.Events {
         get() = store.flag("background", true)
         set(on) { store.setFlag("background", on); changed() }
 
+    // General › Language: the pages redraw at once (tr() reads I18n.lang); the notification
+    // channels' names and the status notification follow.
+    fun setLanguage(code: String) {
+        I18n.choose(code, store)
+        Notify.channels(ctx)
+        changed()
+    }
+
     fun changed() {
         // (runCatching: discovery may report before every feature exists)
         runCatching { wifiFast.hold(link.connected && !link.wired && (screen.viewing || adb.viewed || remote.active)) }
@@ -233,8 +246,20 @@ class Core private constructor(val ctx: Context) : Link.Events {
             }
             return
         }
+        // Not seen on this network: every other Connect through Tailscale, when both are on it (#161).
+        // The address is for this attempt only (a copy); discovery puts the network's back.
+        if (seen == null && tailscale) {
+            tailTurn = !tailTurn
+            val t = Tailnet.address(h)
+            if (tailTurn && t != null && t != h.address && Tailnet.onIt()) {
+                Log.i("TwinDesk", "${h.name} isn’t on this network: through Tailscale")
+                link.connect(h.copy(address = t))
+                return
+            }
+        }
         link.connect(h)
     }
+    @Volatile private var tailTurn = false
 
     // A PC opened a pipe on its own (its Pair or Connect, an invite): a paired one connects through
     // it now, an unpaired one is shown as an invite (Pair asks it for a pipe again).
@@ -274,22 +299,24 @@ class Core private constructor(val ctx: Context) : Link.Events {
     @Volatile private var wiredNonce = ""
 
     // The computer's pairing QR code, scanned here (QrActivity): the first of its addresses that
-    // answers, then pairing with its nonce (only Allow there, as on the cable), or a computer already
-    // paired connects at that address. false: none of them answers from this network.
+    // answers, then pairing with its nonce (only Allow there, as on the cable). A computer already
+    // paired connects where discovery sees it or at its stored address; only when neither answers,
+    // at the code's address for this one attempt, never stored: a browsable link can't re-point it,
+    // and the session pins the computer's certificate, so another machine there fails.
+    // false: none of them answers from this network.
     fun connectQr(id: String, addrs: List<String>, port: Int, nonce: String, name: String): Boolean {
-        val address = addrs.firstOrNull { a ->
-            runCatching { java.net.Socket().use { s -> s.connect(java.net.InetSocketAddress(a, port), 800) }; true }.getOrDefault(false)
-        } ?: return false
-        val h = store.hosts().find { it.id == id }
+        val answers = { a: String, p: Int ->
+            runCatching { java.net.Socket().use { s -> s.connect(java.net.InetSocketAddress(a, p), 800) }; true }.getOrDefault(false)
+        }
         resumeUntil = 0
-        if (h != null) {
-            Log.i("TwinDesk", "QR: connecting to ${h.name} at $address")
-            h.address = address
-            h.port = port
-            store.putHost(h)
-            connect(h)
+        store.hosts().find { it.id == id }?.let { h ->
+            val use = if (discovery.found[h.id] != null || answers(h.address, h.port)) h
+                else addrs.firstOrNull { answers(it, port) }?.let { h.copy(address = it, port = port) } ?: h
+            Log.i("TwinDesk", "QR: connecting to ${h.name}")
+            connect(use)
             return true
         }
+        val address = addrs.firstOrNull { answers(it, port) } ?: return false
         Log.i("TwinDesk", "QR: pairing with ${name.ifEmpty { id }} at $address")
         invite?.let { discovery.clearInvite(it.id) }
         invite = null
@@ -319,7 +346,7 @@ class Core private constructor(val ctx: Context) : Link.Events {
                 val port = blePipe(f.id)
                 if (link.pair?.phase != "connecting" || link.pair?.port != 0) return@execute // cancelled meanwhile
                 if (port != null) link.startPairing("127.0.0.1", port, f.name, viaBle = true)
-                else link.pairUnreachable("${f.name} didn’t answer over Bluetooth. Open TwinDesk on it, or put both on the same Wi-Fi, then Pair again.")
+                else link.pairUnreachable(tr("{name} didn’t answer over Bluetooth. Open TwinDesk on it, or put both on the same Wi-Fi, then Pair again.", "name" to f.name))
             }
             return
         }

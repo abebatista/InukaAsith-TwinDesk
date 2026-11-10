@@ -211,7 +211,7 @@ function pushState() {
     state.client = c ? { id: c.deviceId, name: c.name, os: c.os, role: c.role, address: c.address, rttMs: c.rttMs, transport: c.transport || 'ip' } : null;
     if (svc && svc.net) {
       const hs = c && settings.net.hotspots[c.deviceId];
-      state.net = { ...svc.net.view, ble: settings.net.ble !== false, blePc: settings.net.blePc === true, bleWifiOff: settings.net.bleWifiOff !== false, bleOff, radio: svc.ble.state, hotspotSsid: hs ? hs.ssid : '', hotspotSaved: !!(hs && hs.pass), lan: lanType(c && c.address) };
+      state.net = { ...svc.net.view, ble: settings.net.ble !== false, blePc: settings.net.blePc === true, bleWifiOff: settings.net.bleWifiOff !== false, bleOff, radio: svc.ble.state, hotspotSsid: hs ? hs.ssid : '', hotspotSaved: !!(hs && hs.pass), lan: lanType(c && c.address), tailscale: settings.net.tailscale !== false, tailnet: require('../shared/tailnet.js').mine(), bleInput: settings.net.bleInput === true };
     }
     const { helper, displays, stream, clipboard: clip, kvm } = svc || {};
     state.helper.running = !!(helper && helper.running);
@@ -376,16 +376,14 @@ function clearStalePermissions() {
       !p.accessibility && 'Accessibility',
       p.inputMonitoring === false && 'ListenEvent',
     ].filter(Boolean);
-    const id = 'org.macshare.mac';
-    let left = services.length;
-    const done = () => {
+    const done = (resetErr) => {
+      if (resetErr) return console.warn(`[permissions] reset skipped or failed: ${resetErr.message}`);
       settings.app.signature = m[1];
       store.saveSettings(settings);
       refreshPermissions();
     };
-    if (!left) return done();
-    console.log(`[permissions] new signature: resetting ${services.join(', ')}`);
-    for (const svcName of services) require('child_process').execFile('/usr/bin/tccutil', ['reset', svcName, id], () => --left || done());
+    if (services.length) console.log(`[permissions] new signature: resetting ${services.join(', ')}`);
+    require('./permission-reset').resetMissing(bundle, services, require('child_process').execFile, done);
   });
 }
 
@@ -397,16 +395,11 @@ function setupSeen() {
   store.saveSettings(settings);
 }
 
-// The window exists only while it's open: closing it (to the menu bar) frees its page, about
-// 50-100 MB; opening it again makes it anew (showWindow).
+// A new language restarts TwinDesk: every window then loads English and that language only
+// (shared/lang/pick.js), not every catalog. Settings are already saved (synchronously).
 function changeLanguage() {
-  i18n = I18n.create(I18n.resolveLanguage(settings.ui.language, app.getLocale()));
-  for (const player of BrowserWindow.getAllWindows()) {
-    if (!player.isDestroyed()) player.webContents.send('ui-language', i18n.locale);
-  }
-  trayKey = '';
-  updateTray();
-  if (win && !win.isDestroyed()) win.loadFile(path.join(__dirname, 'control.html'), { query: { language: i18n.locale, look: Look.style(settings.ui.style) } });
+  app.relaunch();
+  app.quit(); // as Quit does: before-quit gives everything back (KVM, calls, the helper)
 }
 
 // General › Appearance changed: the theme; the window's vibrancy only for Simple (Glass paints its
@@ -578,6 +571,7 @@ app.whenReady().then(() => {
   require('../shared/inputlane.js').setLaneProtocol(settings.app.inputProtocol); // General › Advanced, before any lane binds
   // Quiet links (#143): an idle session stops pinging every second; General › Advanced › Keep pinging.
   require('../shared/quiet.js').use(() => !!(settings && settings.app && settings.app.keepPinging === true));
+  require('../shared/tailnet.js').use(() => !(settings && settings.net && settings.net.tailscale === false)); // General › Tailscale (#161)
   i18n = I18n.create(I18n.resolveLanguage(settings.ui.language, app.getLocale()));
   id = identity.load(settings);
   Object.assign(state, { macName: id.macName, macId: id.macId, fp: id.fp, version: app.getVersion(), about: aboutInfo(app) });
@@ -678,6 +672,7 @@ app.whenReady().then(() => {
   }
   pairing.isWired = (nonce) => svc.wired.knows(nonce) || qrKnows(nonce); // the cable, or Connection's QR code (Allow only)
   pairing.isQr = qrKnows;
+  pairing.consumeQr = () => { qrPair = null; }; // a QR pairing that went through: the link is single-use
   // Overview's controls of the other device, and this Mac's for it (shared/devctl.js): the session
   // is peer.js here, its 'client' the start.
   const { DevCtl } = require('../shared/devctl.js');
@@ -961,6 +956,7 @@ app.whenReady().then(() => {
   pairSync = new PairSync({ server: peer, getSettings: () => settings, saveSettings: () => store.saveSettings(settings),
     apply: (f, dir, on) => (f !== 'value' ? SYNC_ACTIONS[f](dir, on)
       : dir === 'rezume' ? actions.setRezume({ on })
+        : dir === 'res' ? actions.setStreamMaxHeight(on)
         : ['gestures', 'ble', 'keyboard', 'speed', 'reverseScroll', 'syncPads'].includes(dir) ? actions.setKvm({ [dir]: on }) : actions.setSharingOpts({ [dir]: on })) });
   // New releases on GitHub: a notification once per version, the menu bar item and About › Updates.
   updates = new Updates({
@@ -1148,7 +1144,8 @@ function setupNet() {
     // The session on the same Wi-Fi a while (General's Turn off Bluetooth on Wi-Fi connections,
     // blepolicy.js wifiQuiet): no advertising, its pipes and the session's Bluetooth fallback closed;
     // back as it was when the session ends.
-    const off = bleQuiet({ on: settings.net.bleWifiOff !== false, current: () => peer.current, onGroup: () => !!svc.net && svc.net.onGroup });
+    peer.useBleInput(settings.net.bleInput === true); // Cursor › Mouse and keyboard over Bluetooth (shared/bleinput.js)
+    const off = bleQuiet({ on: settings.net.bleWifiOff !== false && settings.net.bleInput !== true, current: () => peer.current, onGroup: () => !!svc.net && svc.net.onGroup });
     if (off !== bleOff) {
       bleOff = off;
       console.log(`[ble] ${off ? 'off: the session is on the same Wi-Fi' : 'on again'}`);
